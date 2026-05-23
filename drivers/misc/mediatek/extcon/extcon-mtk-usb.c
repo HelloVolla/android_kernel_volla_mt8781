@@ -745,6 +745,23 @@ bool get_is_docking(void)
 	return is_docking_det;
 }
 
+/* Confirm the dock-detect line settled to @expected by sampling a few
+ * times. Pogo pins can ring for tens of ms after make/break, so the
+ * single read at the end of the IRQ debounce window is not always
+ * trustworthy. Returns true only if every sample matches @expected. */
+static bool docking_state_confirmed(int expected)
+{
+	int i;
+
+	for (i = 0; i < 4; i++) {
+		if ((!gpio_get_value(docking_eint_gpio)) != !!expected)
+			return false;
+		if (i < 3)
+			mdelay(5);
+	}
+	return true;
+}
+
 static void cust_usb_docking_otg_vbus_en(int is_on)
 {
 #if IS_ENABLED(CONFIG_CM_CUST_GPIOS_SUPPORT)
@@ -771,15 +788,43 @@ static void do_docking_delay_work(struct work_struct *work)
 	union power_supply_propval prop2 = {0};
 	int ret = 0;
 	int is_docking = get_is_docking();
-	ret = power_supply_get_property(docking_extcon->usb_psy,
-				POWER_SUPPLY_PROP_ONLINE, &pval);
-		ret = power_supply_get_property(docking_extcon->usb_psy,
-			POWER_SUPPLY_PROP_TYPE, &prop2);
+	int is_host;
 
 	if (!docking_extcon) {
 		printk("docking_extcon = NULL\n");
 		return;
 	}
+
+	/* Reject spurious EINTs from pogo pin bounce: require multiple
+	 * stable samples before acting on the state. */
+	if (!docking_state_confirmed(is_docking)) {
+		pr_info("docking: state unstable, treating IRQ as glitch\n");
+		is_docking = get_is_docking();
+		irq_set_irq_type(docking_eint_num, is_docking ?
+				 IRQF_TRIGGER_HIGH : IRQF_TRIGGER_LOW);
+		enable_irq(docking_eint_num);
+		return;
+	}
+
+	/* If the confirmed dock-detect state matches the current USB host
+	 * role, the connector hasn't really changed - just re-arm the EINT.
+	 * Re-cycling USB_SWITCH / OTG_5V_EN / DOCKING_EN here would
+	 * gratuitously kick a working keyboard off the bus. */
+	is_host = extcon_get_state(docking_extcon->edev, EXTCON_USB_HOST);
+	if ((is_docking && is_host > 0) ||
+	    (!is_docking && is_host <= 0)) {
+		pr_info("docking: no state change (is_docking=%d is_host=%d)\n",
+			is_docking, is_host);
+		irq_set_irq_type(docking_eint_num, is_docking ?
+				 IRQF_TRIGGER_HIGH : IRQF_TRIGGER_LOW);
+		enable_irq(docking_eint_num);
+		return;
+	}
+
+	ret = power_supply_get_property(docking_extcon->usb_psy,
+				POWER_SUPPLY_PROP_ONLINE, &pval);
+		ret = power_supply_get_property(docking_extcon->usb_psy,
+			POWER_SUPPLY_PROP_TYPE, &prop2);
 
 #if defined(CONFIG_WB_DOCKING_POLLING_TRACK_SUPPORT)
 	cancel_delayed_work_sync(&docking_delay_track_work);
@@ -985,12 +1030,10 @@ static irqreturn_t mt_usb_docking_int(int irq, void *dev_id)
 
 	__pm_wakeup_event(docking_suspend_lock, 2000); //Leo 20240304
 
-	if (docking_iddig_boot) {
-		docking_iddig_debounce = 50;
-		docking_iddig_boot = false;
-	} else{
-		docking_iddig_debounce = 50;
-	}
+	/* 100 ms is enough to ride out typical pogo pin bounce; the work
+	 * does additional multi-sample confirmation. */
+	docking_iddig_debounce = 100;
+	docking_iddig_boot = false;
 
 #if defined(M100TBR210_KJ_965) //Leo 20231128
 		docking_iddig_debounce = 300;
