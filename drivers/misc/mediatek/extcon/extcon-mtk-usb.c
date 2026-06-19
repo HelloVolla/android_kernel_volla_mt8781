@@ -47,6 +47,12 @@ struct wakeup_source *extcon_wakelock;
 
 #if IS_ENABLED(CONFIG_WB_DOCKING_SUPPORT)
 int docking_iddig_debounce = 50;
+/* Hardware debounce for the dock-detect EINT. A marginal pogo contact makes
+ * the line bounce; each bounce fires the EINT and is acted on as a
+ * dock/undock event, cycling the keyboard rails and dropping the keyboard
+ * off the bus. Filter bounces shorter than this so only a settled
+ * dock/undock edge gets through. */
+#define DOCKING_EINT_DEBOUNCE_US 128000
 static bool docking_iddig_boot = true;
 static int docking_eint_gpio;
 static int is_docking_det = false;
@@ -1239,6 +1245,11 @@ static int mtk_usb_extcon_probe(struct platform_device *pdev)
 		pr_err("MUSB docking :%s : docking_eint_gpio failed!\n",__func__);
 		return ret;
 	}
+
+	ret = gpio_set_debounce(docking_eint_gpio, DOCKING_EINT_DEBOUNCE_US);
+	if (ret < 0)
+		pr_info("MUSB docking :%s : set debounce failed, ret<%d>\n",
+			__func__, ret);
 
 #if 1 //Leo add for pull up docking eint pin 20230327
 	extcon_pinctrl = devm_pinctrl_get(&pdev->dev);
